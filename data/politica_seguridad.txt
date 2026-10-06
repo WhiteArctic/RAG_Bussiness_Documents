@@ -1,0 +1,26 @@
+Política de Seguridad de la Información
+
+Contraseñas
+Todas las cuentas corporativas deben usar contraseñas de al menos 12 caracteres,
+con mayúsculas, minúsculas, números y símbolos. Las contraseñas se renuevan cada
+90 días y no pueden repetirse respecto a las últimas 5 utilizadas.
+
+Autenticación de doble factor
+El doble factor de autenticación (2FA) es obligatorio para acceder a todos los
+sistemas que manejen datos de clientes. Se recomienda el uso de aplicaciones de
+autenticación por encima del SMS.
+
+Manejo de datos sensibles
+Los datos personales de clientes se consideran información confidencial y deben
+almacenarse cifrados tanto en reposo como en tránsito. Está prohibido descargar
+bases de datos de clientes a equipos personales.
+
+Reporte de incidentes
+Cualquier incidente de seguridad (phishing, acceso no autorizado, pérdida de un
+dispositivo) debe reportarse al equipo de seguridad en un plazo máximo de 1 hora
+desde su detección, a través del canal de incidentes.
+
+Acceso de terceros
+Los proveedores externos solo reciben acceso bajo el principio de mínimo
+privilegio y por tiempo limitado. Todo acceso de terceros se revoca
+automáticamente al finalizar el contrato.
