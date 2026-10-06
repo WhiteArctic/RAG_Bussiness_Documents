@@ -3,11 +3,11 @@
 Este módulo implementa, paso a paso, el flujo completo de Retrieval-Augmented
 Generation. Se construye de forma incremental a lo largo del Bloque 3:
 
-    [1] INGESTA  <-- este paso
-    [2] chunking
-    [3] embeddings
-    [4] vector store (en memoria, numpy)
-    [5] retrieval top-k (similitud coseno)
+    [1] ingesta       (hecho)
+    [2] chunking      (hecho)
+    [3] embeddings    (hecho, en app/llm.py)
+    [4] VECTOR STORE (en memoria, numpy)   <-- este paso
+    [5] RETRIEVAL top-k (similitud coseno)  <-- este paso
     [6] construcción de contexto
     [7] generación con citas
     [8] integración en el endpoint /ask
@@ -70,37 +70,38 @@ def load_documents(data_dir: Path = DATA_DIR) -> list[Document]:
 
     return documents
 
+
 # ---------------------------------------------------------------------------
 # [2] CHUNKING
 # ---------------------------------------------------------------------------
- 
+
 # Parámetros de chunking. Expuestos como constantes para poder ajustarlos y
 # justificarlos. ~19% de overlap, dentro del rango recomendado (10-20%).
 CHUNK_SIZE = 800      # caracteres por chunk (~1 sección/idea)
 CHUNK_OVERLAP = 150   # caracteres repetidos entre chunks consecutivos
- 
- 
+
+
 @dataclass
 class Chunk:
     """Un trozo de un documento, listo para vectorizar.
- 
+
     Arrastra 'source' desde el Document de origen: sin esto, al convertir el
     texto en un vector perderíamos de qué archivo vino (ver Paso 1). Lo
     necesitaremos para citar la fuente en la respuesta final.
     """
- 
+
     source: str  # archivo de origen, heredado del Document
     text: str    # contenido del chunk
- 
- 
+
+
 def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
     """Parte un texto en trozos de 'size' caracteres con 'overlap' de solape.
- 
+
     Mecanismo (ventana deslizante):
     - Tomamos [0:size], luego avanzamos 'size - overlap' y tomamos el siguiente.
     - El overlap hace que el final de un chunk se repita al inicio del siguiente,
       para no partir una idea justo en el corte.
- 
+
     Guardas (defensa en la entrevista):
     - overlap debe ser < size, si no el puntero no avanzaría (bucle infinito).
     """
@@ -108,11 +109,11 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
         raise ValueError("size debe ser > 0")
     if overlap < 0 or overlap >= size:
         raise ValueError("overlap debe estar en el rango [0, size)")
- 
+
     text = text.strip()
     if not text:
         return []
- 
+
     step = size - overlap  # cuánto avanza la ventana en cada iteración
     chunks: list[str] = []
     start = 0
@@ -122,8 +123,8 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
             chunks.append(chunk)
         start += step
     return chunks
- 
- 
+
+
 def chunk_documents(documents: list[Document]) -> list[Chunk]:
     """Trocea una lista de Documents en Chunks, preservando el 'source'."""
     chunks: list[Chunk] = []
@@ -131,3 +132,94 @@ def chunk_documents(documents: list[Document]) -> list[Chunk]:
         for piece in chunk_text(doc.text):
             chunks.append(Chunk(source=doc.source, text=piece))
     return chunks
+
+
+# ---------------------------------------------------------------------------
+# [4] VECTOR STORE (en memoria) + [5] RETRIEVAL (similitud coseno, top-k)
+# ---------------------------------------------------------------------------
+import numpy as np
+
+from app.llm import embed_texts, embed_query
+
+# Cuántos chunks recupera el retrieval por pregunta. top_k=3: suficiente
+# contexto sin inflar el prompt (costo/ruido). Trade-off ajustable.
+TOP_K = 3
+
+
+@dataclass
+class RetrievedChunk:
+    """Un chunk recuperado junto con su score de similitud (para citar/ordenar)."""
+
+    source: str
+    text: str
+    score: float
+
+
+class VectorStore:
+    """Índice de vectores en memoria (numpy).
+
+    Es la versión PoC de un vector store. En producción esto se reemplaza por
+    un servicio gestionado (Vertex AI Vector Search, Pinecone, pgvector...),
+    porque un índice en memoria no persiste ni se comparte entre instancias
+    stateless de Cloud Run. La INTERFAZ (build / search) se mantendría igual:
+    así cambiar el backend no toca el resto del pipeline.
+    """
+
+    def __init__(self) -> None:
+        self._chunks: list[Chunk] = []
+        self._matrix: np.ndarray | None = None  # shape (n_chunks, dim)
+
+    def build(self, chunks: list[Chunk]) -> None:
+        """Embebe los chunks UNA sola vez y los guarda como una matriz.
+
+        Esto es la 'indexación' (offline): la operación cara se hace al
+        arrancar, no por request.
+        """
+        if not chunks:
+            raise ValueError("No hay chunks para indexar.")
+        self._chunks = chunks
+        vectors = embed_texts([c.text for c in chunks])
+        # Normalizamos cada vector a norma 1. Así la similitud coseno se reduce
+        # a un simple producto punto (más rápido) y es numéricamente estable.
+        matrix = np.array(vectors, dtype=np.float32)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        self._matrix = matrix / np.clip(norms, 1e-12, None)
+
+    def search(self, query: str, top_k: int = TOP_K) -> list[RetrievedChunk]:
+        """Devuelve los top_k chunks más similares a la pregunta.
+
+        Pasos: embeber la pregunta -> normalizar -> producto punto con toda la
+        matriz (coseno) -> ordenar -> tomar los k mejores.
+        """
+        if self._matrix is None:
+            raise RuntimeError("El índice no está construido. Llama a build() primero.")
+
+        q = np.array(embed_query(query), dtype=np.float32)
+        q = q / np.clip(np.linalg.norm(q), 1e-12, None)
+
+        # Una sola multiplicación matriz-vector calcula TODAS las similitudes.
+        # Vectorizado con numpy: rápido incluso con miles de chunks.
+        scores = self._matrix @ q  # shape (n_chunks,)
+
+        # argsort descendente y tomamos los primeros top_k.
+        top_idx = np.argsort(-scores)[:top_k]
+        return [
+            RetrievedChunk(
+                source=self._chunks[i].source,
+                text=self._chunks[i].text,
+                score=float(scores[i]),
+            )
+            for i in top_idx
+        ]
+
+
+def build_index(data_dir: Path = DATA_DIR) -> VectorStore:
+    """Pipeline de indexación completo: cargar -> trocear -> embeber -> indexar.
+
+    Se llama UNA vez al arrancar la app (ver Paso 8).
+    """
+    documents = load_documents(data_dir)
+    chunks = chunk_documents(documents)
+    store = VectorStore()
+    store.build(chunks)
+    return store
