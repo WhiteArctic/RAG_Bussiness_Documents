@@ -6,11 +6,11 @@ Generation. Se construye de forma incremental a lo largo del Bloque 3:
     [1] ingesta       (hecho)
     [2] chunking      (hecho)
     [3] embeddings    (hecho, en app/llm.py)
-    [4] VECTOR STORE (en memoria, numpy)   <-- este paso
-    [5] RETRIEVAL top-k (similitud coseno)  <-- este paso
-    [6] construcción de contexto
-    [7] generación con citas
-    [8] integración en el endpoint /ask
+    [4] vector store (en memoria, numpy)    (hecho)
+    [5] retrieval top-k (similitud coseno)  (hecho)
+    [6] CONSTRUCCIÓN DE CONTEXTO            <-- este paso
+    [7] GENERACIÓN CON CITAS                <-- este paso
+    [8] integración en el endpoint /ask    (hecho) -> BLOQUE 3 COMPLETO
 
 Decisión pedagógica: NO usamos LangChain ni LlamaIndex. Hacemos cada pieza a
 mano para entender el mecanismo (y poder defenderlo en la entrevista).
@@ -139,7 +139,9 @@ def chunk_documents(documents: list[Document]) -> list[Chunk]:
 # ---------------------------------------------------------------------------
 import numpy as np
 
-from app.llm import embed_texts, embed_query
+from app.llm import embed_texts, embed_query, generate_grounded_answer
+from app.costs import estimate_cost_usd
+from app.config import settings
 
 # Cuántos chunks recupera el retrieval por pregunta. top_k=3: suficiente
 # contexto sin inflar el prompt (costo/ruido). Trade-off ajustable.
@@ -223,3 +225,62 @@ def build_index(data_dir: Path = DATA_DIR) -> VectorStore:
     store = VectorStore()
     store.build(chunks)
     return store
+
+
+# ---------------------------------------------------------------------------
+# [6] CONSTRUCCIÓN DE CONTEXTO + [7] GENERACIÓN CON CITAS
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RAGAnswer:
+    """Respuesta final del pipeline RAG: texto + fuentes + métricas LLMOps."""
+
+    answer: str
+    sources: list[str]       # fuentes únicas usadas, para trazabilidad
+    input_tokens: int = 0    # tokens de entrada (para costo)
+    output_tokens: int = 0   # tokens de salida (para costo)
+    cost_usd: float = 0.0    # costo estimado de la generación
+
+
+def build_context(chunks: list[RetrievedChunk]) -> str:
+    """Formatea los chunks recuperados en un bloque de texto para el prompt.
+
+    Decisiones:
+    - Etiquetamos cada fragmento con su fuente ([Fuente: ...]). Así el LLM
+      PUEDE citar, y el texto queda trazable dentro del propio prompt.
+    - Numeramos los fragmentos: ayuda al modelo a referenciarlos y a nosotros
+      a depurar qué contexto recibió.
+    """
+    bloques = []
+    for i, c in enumerate(chunks, start=1):
+        bloques.append(f"[Fragmento {i}] [Fuente: {c.source}]\n{c.text}")
+    return "\n\n".join(bloques)
+
+
+def answer_question(store: VectorStore, question: str, top_k: int = TOP_K) -> RAGAnswer:
+    """Pipeline RAG de query completo (lo que ocurre en cada /ask):
+
+        pregunta -> retrieval top-k -> armar contexto -> generar (grounded)
+
+    Devuelve la respuesta y las fuentes únicas, en orden de relevancia.
+    """
+    retrieved = store.search(question, top_k=top_k)
+    context = build_context(retrieved)
+    result = generate_grounded_answer(question, context)
+
+    # Fuentes únicas preservando el orden de relevancia (dict.fromkeys = dedup
+    # estable). Útil para citar sin repetir el mismo archivo.
+    sources = list(dict.fromkeys(c.source for c in retrieved))
+
+    # Métricas LLMOps: tokens reales + costo estimado de esta request.
+    cost = estimate_cost_usd(
+        settings.gemini_model, result.input_tokens, result.output_tokens
+    )
+    return RAGAnswer(
+        answer=result.text,
+        sources=sources,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+        cost_usd=cost,
+    )

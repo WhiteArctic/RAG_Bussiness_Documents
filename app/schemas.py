@@ -25,3 +25,7 @@ class AskResponse(BaseModel):
 
     answer: str = Field(..., description="Respuesta generada por el LLM.")
     model: str = Field(..., description="Modelo usado para generar la respuesta.")
+    sources: list[str] = Field(
+        default_factory=list,
+        description="Documentos fuente usados para responder (trazabilidad/citas).",
+    )
